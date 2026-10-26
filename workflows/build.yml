@@ -1,0 +1,114 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+
+env:
+  PYTHON_VERSION: "3.11"
+  APP_NAME: "AutoRetouch"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE with PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean --windowed
+          --name ${{ env.APP_NAME }}
+          --collect-all mediapipe
+          --collect-all customtkinter
+          --collect-all cv2
+          --collect-submodules mediapipe.python.solutions
+          --hidden-import mediapipe.python.solutions.face_detection
+          --hidden-import mediapipe.python.solutions.face_mesh
+          --hidden-import mediapipe.python.solutions.selfie_segmentation
+          --hidden-import mediapipe.python.solutions.drawing_utils
+          --add-data "engine.py;."
+          auto_retouch.py
+
+      - name: Verify EXE exists
+        shell: pwsh
+        run: |
+          $exe = "dist\${{ env.APP_NAME }}\${{ env.APP_NAME }}.exe"
+          if (-not (Test-Path $exe)) { throw "EXE not found" }
+          Get-Item $exe | Select-Object Name, Length
+
+      - name: Self-test
+        shell: pwsh
+        run: |
+          $exe = "dist\${{ env.APP_NAME }}\${{ env.APP_NAME }}.exe"
+          $testFile = "dist\${{ env.APP_NAME }}\selftest.txt"
+          if (Test-Path $testFile) { Remove-Item $testFile -Force }
+          $proc = Start-Process -FilePath $exe `
+            -ArgumentList "--selftest" -Wait -PassThru -NoNewWindow
+          Write-Host "Exit code: $($proc.ExitCode)"
+          if (-not (Test-Path $testFile)) {
+            throw "selftest.txt not created - EXE crashed"
+          }
+          $result = Get-Content $testFile -Raw
+          Write-Host "Result: $result"
+          if ($result.Trim() -ne "OK") {
+            throw "Self-test failed"
+          }
+          Remove-Item $testFile
+
+      - name: Zip portable build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist\${{ env.APP_NAME }}\*" `
+            -DestinationPath "${{ env.APP_NAME }}_portable.zip" -Force
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          echo "ISCC_PATH=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & $env:ISCC_PATH "installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoRetouch-portable
+          path: ${{ env.APP_NAME }}_portable.zip
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoRetouch-installer
+          path: Output\*.exe
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Output/*.exe
+            *_portable.zip
+          draft: false
